@@ -350,6 +350,7 @@ void jl_jit_globals(std::map<void *, GlobalVariable*> &globals)
     }
 }
 
+
 // this generates llvm code for the lambda info
 // and adds the result to the jitlayers
 // (and the shadow module),
@@ -374,15 +375,16 @@ static jl_generic_fptr_t _jl_compile_linfo(
 
     jl_generic_fptr_t fptr = {};
     // emit the code in LLVM IR form
-    jl_codegen_call_targets_t workqueue;
-    std::map<void *, GlobalVariable*> globals;
-    std::map<jl_method_instance_t *, std::tuple<std::unique_ptr<Module>, jl_llvm_functions_t, jl_value_t*, uint8_t>> emitted;
-    jl_compile_result_t result = jl_compile_linfo1(li, src, world, workqueue, globals, true, &jl_default_cgparams);
+    jl_codegen_params_t params;
+    params.cache = true;
+    params.world = world;
+    std::map<jl_method_instance_t *, jl_compile_result_t> emitted;
+    jl_compile_result_t result = jl_compile_linfo1(li, src, params);
     if (std::get<0>(result))
         emitted[li] = std::move(result);
-    jl_compile_workqueue(world, true, emitted, workqueue, globals);
+    jl_compile_workqueue(emitted, params);
 
-    jl_jit_globals(globals);
+    jl_jit_globals(params.globals);
     for (auto &def : emitted) {
         // Add the results to the execution engine now
         jl_finalize_module(std::move(std::get<0>(def.second)));
@@ -424,18 +426,16 @@ static jl_generic_fptr_t _jl_compile_linfo(
 
 void jl_strip_llvm_debug(Module *m);
 
-Function *jl_cfunction_object(jl_function_t *f, jl_value_t *rt, jl_tupletype_t *argt,
-        std::map<void *, GlobalVariable*> &globals);
-
 // get the address of a C-callable entry point for a function
 extern "C" JL_DLLEXPORT
 void *jl_function_ptr(jl_function_t *f, jl_value_t *rt, jl_value_t *argt)
 {
     JL_GC_PUSH1(&argt);
     JL_LOCK(&codegen_lock);
-    std::map<void *, GlobalVariable*> globals;
-    Function *llvmf = jl_cfunction_object(f, rt, (jl_tupletype_t*)argt, globals);
-    jl_jit_globals(globals);
+    jl_codegen_params_t params;
+    Function *llvmf = jl_cfunction_object(f, rt, (jl_tupletype_t*)argt, params);
+    jl_jit_globals(params.globals);
+    assert(params.workqueue.empty());
     jl_add_to_ee();
     JL_GC_POP();
     void *ptr = (void*)getAddressForFunction(llvmf->getName());
@@ -450,9 +450,10 @@ void jl_extern_c(jl_function_t *f, jl_value_t *rt, jl_value_t *argt, char *name)
 {
     assert(jl_is_tuple_type(argt));
     JL_LOCK(&codegen_lock);
-    std::map<void *, GlobalVariable*> globals;
-    Function *llvmf = jl_cfunction_object(f, rt, (jl_tupletype_t*)argt, globals);
-    jl_jit_globals(globals);
+    jl_codegen_params_t params;
+    Function *llvmf = jl_cfunction_object(f, rt, (jl_tupletype_t*)argt, params);
+    jl_jit_globals(params.globals);
+    assert(params.workqueue.empty());
     // force eager emission of the function (llvm 3.3 gets confused otherwise and tries to do recursive compilation)
     jl_add_to_ee();
     uint64_t Addr = getAddressForFunction(llvmf->getName());

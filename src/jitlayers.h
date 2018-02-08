@@ -62,21 +62,28 @@ struct jl_returninfo_t {
 typedef std::vector<std::tuple<jl_method_instance_t*, jl_returninfo_t::CallingConv, llvm::Function*, jl_value_t*, bool>> jl_codegen_call_targets_t;
 typedef std::tuple<std::unique_ptr<Module>, jl_llvm_functions_t, jl_value_t*, uint8_t> jl_compile_result_t;
 
+typedef struct {
+    // outputs
+    jl_codegen_call_targets_t workqueue;
+    std::map<void *, GlobalVariable*> globals;
+    // inputs
+    size_t world = 0;
+    const jl_cgparams_t *params = &jl_default_cgparams;
+    bool cache = false;
+} jl_codegen_params_t;
+
 jl_compile_result_t jl_compile_linfo1(
         jl_method_instance_t *li,
         jl_code_info_t *src,
-        size_t world,
-        jl_codegen_call_targets_t &workqueue,
-        std::map<void *, GlobalVariable*> &globals,
-        bool cache,
-        const jl_cgparams_t *params);
+        jl_codegen_params_t &params);
 
 void jl_compile_workqueue(
-    size_t world,
-    bool cache,
     std::map<jl_method_instance_t *, jl_compile_result_t> &emitted,
-    jl_codegen_call_targets_t &workqueue,
-    std::map<void *, GlobalVariable*> &globals);
+    jl_codegen_params_t &params);
+
+Function *jl_cfunction_object(jl_function_t *f, jl_value_t *rt, jl_tupletype_t *argt,
+    jl_codegen_params_t &params);
+
 
 // Connect Modules via prototypes, each owned by module `M`
 static inline GlobalVariable *global_proto(GlobalVariable *G, Module *M = NULL)

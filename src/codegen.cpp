@@ -506,7 +506,8 @@ static jl_returninfo_t get_specsig_function(Module *M, StringRef name, jl_value_
 class jl_codectx_t {
 public:
     IRBuilder<> builder;
-    jl_codegen_call_targets_t *call_targets = NULL;
+    jl_codegen_params_t &emission_context;
+    jl_codegen_call_targets_t &call_targets;
     std::map<void*, GlobalVariable*> &global_targets;
     Function *f = NULL;
     // local var info. globals are not in here.
@@ -540,12 +541,14 @@ public:
     bool use_cache = false;
     const jl_cgparams_t *params = NULL;
 
-    jl_codectx_t(LLVMContext &llvmctx, jl_codegen_call_targets_t &call_targets,
-            std::map<void*, GlobalVariable*> &globals)
-      : builder(llvmctx), call_targets(&call_targets), global_targets(globals) { }
-
-    jl_codectx_t(LLVMContext &llvmctx, std::map<void*, GlobalVariable*> &globals)
-      : builder(llvmctx), global_targets(globals) { }
+    jl_codectx_t(LLVMContext &llvmctx, jl_codegen_params_t &params)
+      : builder(llvmctx),
+        emission_context(params),
+        call_targets(params.workqueue),
+        global_targets(params.globals),
+        world(params.world),
+        use_cache(params.cache),
+        params(params.params) { }
 
     ~jl_codectx_t() {
         assert(this->roots == NULL);
@@ -2624,8 +2627,7 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, jl_expr_t *ex)
                 result = emit_call_function_object(ctx, li, protoname, argv, nargs, rt);
             if (need_to_emit) {
                 Function *trampoline_decl = cast<Function>(jl_Module->getNamedValue(protoname));
-                if (ctx.call_targets)
-                    ctx.call_targets->push_back(std::make_tuple(li, cc, trampoline_decl, li->rettype, specsig));
+                ctx.call_targets.push_back(std::make_tuple(li, cc, trampoline_decl, li->rettype, specsig));
             }
         }
         else {
@@ -3585,16 +3587,14 @@ static void emit_last_age_field(jl_codectx_t &ctx)
             ConstantInt::get(T_size, offsetof(jl_tls_states_t, world_age) / sizeof(size_t)));
 }
 
-void emit_cfunc_invalidate(
+static void emit_cfunc_invalidate(
         Function *gf_thunk, jl_returninfo_t::CallingConv cc,
         jl_value_t *calltype, jl_value_t *rettype,
-        size_t nargs, size_t world,
-        std::map<void *, GlobalVariable*> &globals)
+        size_t nargs,
+        jl_codegen_params_t &params)
 {
-    jl_codectx_t ctx(jl_LLVMContext, globals);
+    jl_codectx_t ctx(jl_LLVMContext, params);
     ctx.f = gf_thunk;
-    ctx.world = world;
-    ctx.params = &jl_default_cgparams;
 
     BasicBlock *b0 = BasicBlock::Create(jl_LLVMContext, "top", gf_thunk);
     ctx.builder.SetInsertPoint(b0);
@@ -3680,7 +3680,7 @@ void emit_cfunc_invalidate(
 
 static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_tupletype_t *argt,
                                   jl_typemap_entry_t *sf, jl_value_t *declrt, jl_tupletype_t *sigt,
-                                  std::map<void *, GlobalVariable*> &globals)
+                                  jl_codegen_params_t &params)
 {
     // Generate a c-callable wrapper
     bool toboxed;
@@ -3747,11 +3747,10 @@ static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_t
 #endif
     Function *cw_proto = function_proto(cw);
 
-    jl_codectx_t ctx(jl_LLVMContext, globals);
+    jl_codectx_t ctx(jl_LLVMContext, params);
     ctx.f = cw;
     ctx.linfo = lam;
     ctx.world = world;
-    ctx.params = &jl_default_cgparams;
 
     BasicBlock *b0 = BasicBlock::Create(jl_LLVMContext, "top", cw);
     ctx.builder.SetInsertPoint(b0);
@@ -3928,7 +3927,7 @@ static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_t
             // build a  specsig -> jl_apply_generic converter thunk
             // this builds a method that calls jl_apply_generic (as a closure over a singleton function pointer),
             // but which has the signature of a specsig
-            emit_cfunc_invalidate(gf_thunk, returninfo.cc, lam->specTypes, lam->rettype, nargs + 1, world, ctx.global_targets);
+            emit_cfunc_invalidate(gf_thunk, returninfo.cc, lam->specTypes, lam->rettype, nargs + 1, ctx.emission_context);
             theFptr = ctx.builder.CreateSelect(age_ok, theFptr, gf_thunk);
         }
         CallInst *call = ctx.builder.CreateCall(theFptr, ArrayRef<Value*>(args));
@@ -4054,7 +4053,7 @@ const struct jl_typemap_info cfunction_cache = {
 // and argument types.
 // here argt does not include the leading function type argument
 Function *jl_cfunction_object(jl_function_t *ff, jl_value_t *declrt, jl_tupletype_t *argt,
-        std::map<void*, GlobalVariable*> &globals)
+                              jl_codegen_params_t &params)
 {
     // Assumes the codegen lock is acquired. The caller is responsible for that.
 
@@ -4127,14 +4126,14 @@ Function *jl_cfunction_object(jl_function_t *ff, jl_value_t *declrt, jl_tupletyp
     }
 
     // Backup the info for the nested compile
-    Function *f = gen_cfun_wrapper(ff, crt, (jl_tupletype_t*)argt, sf, declrt, (jl_tupletype_t*)sigt, globals);
+    Function *f = gen_cfun_wrapper(ff, crt, (jl_tupletype_t*)argt, sf, declrt, (jl_tupletype_t*)sigt, params);
     JL_GC_POP();
     return f;
 }
 
 // generate a julia-callable function that calls f (AKA lam)
 static Function *gen_jlcall_wrapper(jl_method_instance_t *lam, const jl_returninfo_t &f, StringRef funcName,
-        Module *M, std::map<void *, GlobalVariable*> &globals)
+        Module *M, jl_codegen_params_t &params)
 {
     Function *w = Function::Create(jl_func_sig, GlobalVariable::ExternalLinkage,
                                    funcName, M);
@@ -4148,11 +4147,10 @@ static Function *gen_jlcall_wrapper(jl_method_instance_t *lam, const jl_returnin
     Value *argArray = &*AI++;
     /* const Argument &argCount = *AI++; */
 
-    jl_codectx_t ctx(jl_LLVMContext, globals);
+    jl_codectx_t ctx(jl_LLVMContext, params);
     ctx.f = w;
     ctx.linfo = lam;
     ctx.world = 0;
-    ctx.params = &jl_default_cgparams;
 
     BasicBlock *b0 = BasicBlock::Create(jl_LLVMContext, "top", w);
     ctx.builder.SetInsertPoint(b0);
@@ -4364,16 +4362,11 @@ static std::pair<std::unique_ptr<Module>, jl_llvm_functions_t>
     emit_function(
         jl_method_instance_t *lam,
         jl_code_info_t *src,
-        size_t world,
-        bool use_cache,
-        const jl_cgparams_t *params,
-        // outputs:
-        jl_codegen_call_targets_t &workqueue,
-        std::map<void *, GlobalVariable*> &globals)
+        jl_codegen_params_t &params)
 {
     // step 1. unpack AST and allocate codegen context for this function
     jl_llvm_functions_t declarations;
-    jl_codectx_t ctx(jl_LLVMContext, workqueue, globals);
+    jl_codectx_t ctx(jl_LLVMContext, params);
     JL_GC_PUSH2(&ctx.code, &ctx.roots);
     ctx.code = src->code;
 
@@ -4385,11 +4378,8 @@ static std::pair<std::unique_ptr<Module>, jl_llvm_functions_t>
     ctx.module = jl_is_method(lam->def.method) ? lam->def.method->module : lam->def.module;
     ctx.linfo = lam;
     ctx.source = src;
-    ctx.world = world;
     ctx.name = name_from_method_instance(lam);
     ctx.funcName = ctx.name;
-    ctx.use_cache = use_cache;
-    ctx.params = params;
     ctx.spvals_ptr = NULL;
     ctx.nargs = jl_is_method(lam->def.method) ? lam->def.method->nargs : 0;
     bool toplevel = !jl_is_method(lam->def.method);
@@ -4452,7 +4442,7 @@ static std::pair<std::unique_ptr<Module>, jl_llvm_functions_t>
 
     jl_value_t *jlrettype = lam->rettype;
     bool specsig, needsparams;
-    std::tie(specsig, needsparams) = uses_specsig(lam, params->prefer_specsig);
+    std::tie(specsig, needsparams) = uses_specsig(lam, params.params->prefer_specsig);
     if (!src->inferred)
         specsig = false;
 
@@ -4516,7 +4506,7 @@ static std::pair<std::unique_ptr<Module>, jl_llvm_functions_t>
 
     // allocate Function declarations and wrapper objects
     Module *M = new Module(ctx.name, jl_LLVMContext);
-    jl_setup_module(M, params);
+    jl_setup_module(M, ctx.params);
     jl_returninfo_t returninfo = {};
     Function *f = NULL;
     Function *fwrap = NULL;
@@ -4527,7 +4517,7 @@ static std::pair<std::unique_ptr<Module>, jl_llvm_functions_t>
         returninfo = get_specsig_function(M, declarations.specFunctionObject, lam->specTypes, jlrettype);
         f = returninfo.decl;
         ctx.has_sret = (returninfo.cc == jl_returninfo_t::SRet || returninfo.cc == jl_returninfo_t::Union);
-        fwrap = gen_jlcall_wrapper(lam, returninfo, declarations.functionObject, M, globals);
+        fwrap = gen_jlcall_wrapper(lam, returninfo, declarations.functionObject, M, ctx.emission_context);
     }
     else {
         f = Function::Create(needsparams ? jl_func_sig_sparams : jl_func_sig,
@@ -5438,22 +5428,18 @@ static int32_t jl_jlcall_api(StringRef fname)
 jl_compile_result_t jl_compile_linfo1(
         jl_method_instance_t *li,
         jl_code_info_t *src,
-        size_t world,
-        jl_codegen_call_targets_t &workqueue,
-        std::map<void *, GlobalVariable*> &globals,
-        bool cache,
-        const jl_cgparams_t *params)
+        jl_codegen_params_t &params)
 {
     // caller must hold codegen_lock
     jl_llvm_functions_t decls = {};
     std::unique_ptr<Module> m;
-    assert(li->min_world <= world && (li->max_world >= world || li->max_world == 0) &&
+    assert(li->min_world <= params.world && (li->max_world >= params.world || li->max_world == 0) &&
         "invalid world for method-instance");
-    assert((params == &jl_default_cgparams /* fast path */ || !cache ||
-        compare_cgparams(params, &jl_default_cgparams)) &&
+    assert((params.params == &jl_default_cgparams /* fast path */ || !params.cache ||
+        compare_cgparams(params.params, &jl_default_cgparams)) &&
         "functions compiled with custom codegen params must not be cached");
     JL_TRY {
-        std::tie(m, decls) = emit_function(li, src, world, cache, params, workqueue, globals);
+        std::tie(m, decls) = emit_function(li, src, params);
     }
     JL_CATCH {
         // Something failed! This is very, very bad.
@@ -5470,11 +5456,11 @@ jl_compile_result_t jl_compile_linfo1(
         jlbacktrace(); // written to STDERR_FILENO
     }
 
-    if (cache && !decls.functionObject.empty()) {
+    if (params.cache && !decls.functionObject.empty()) {
         // Prepare debug info to receive this function
         // record that this function name came from this linfo,
         // so we can build a reverse mapping for debug-info.
-        if (!JL_HOOK_TEST(params, module_activation)) {
+        if (!JL_HOOK_TEST(params.params, module_activation)) {
             bool toplevel = !jl_is_method(li->def.method);
             if (!toplevel) {
                 const DataLayout &DL = m->getDataLayout();
@@ -5501,7 +5487,7 @@ jl_compile_result_t jl_compile_linfo1(
                 // don't delete code when generating a precompile file
                 !imaging_mode &&
                 // don't delete code when it's not actually directly being used
-                world) {
+                params.world) {
             li->inferred = jl_nothing;
         }
     }
@@ -5510,29 +5496,26 @@ jl_compile_result_t jl_compile_linfo1(
 }
 
 void jl_compile_workqueue(
-    size_t world,
-    bool cache,
     std::map<jl_method_instance_t *, jl_compile_result_t> &emitted,
-    jl_codegen_call_targets_t &workqueue,
-    std::map<void *, GlobalVariable*> &globals)
+    jl_codegen_params_t &params)
 {
     jl_code_info_t *src = NULL;
     JL_GC_PUSH1(&src);
-    while (!workqueue.empty()) {
+    while (!params.workqueue.empty()) {
         jl_llvm_functions_t decls = {};
         jl_method_instance_t *li;
         Function *protodecl;
         jl_returninfo_t::CallingConv proto_cc;
         bool proto_specsig;
         jl_value_t *proto_rettype;
-        std::tie(li, proto_cc, protodecl, proto_rettype, proto_specsig) = workqueue.back();
-        workqueue.pop_back();
+        std::tie(li, proto_cc, protodecl, proto_rettype, proto_specsig) = params.workqueue.back();
+        params.workqueue.pop_back();
         // try to emit code for this item from the workqueue
         jl_value_t *rettype = li->rettype;
-        if (li->min_world > world || li->max_world < world) {
+        if (li->min_world > params.world || li->max_world < params.world) {
             // assert(0);
         }
-        else if (cache && li->fptr && li->jlcall_api == JL_API_GENERIC) {
+        else if (params.cache && li->fptr && li->jlcall_api == JL_API_GENERIC) {
 
             decls.functionObject = jl_ExecutionEngine->getFunctionAtAddress((uint64_t)(uintptr_t)li->fptr, li);
             if (li->fptr_specsig)
@@ -5550,7 +5533,7 @@ void jl_compile_workqueue(
                     if (jl_is_method(li->def.method))
                         src = jl_uncompress_ast(li->def.method, (jl_array_t*)src);
                     if (jl_is_code_info(src)) {
-                        result = jl_compile_linfo1(li, src, world, workqueue, globals, cache, &jl_default_cgparams);
+                        result = jl_compile_linfo1(li, src, params);
                     }
                 }
                 if (std::get<0>(result)) {
@@ -5572,7 +5555,7 @@ void jl_compile_workqueue(
                 protodecl->setLinkage(GlobalVariable::PrivateLinkage);
                 protodecl->addFnAttr("no-frame-pointer-elim", "true");
                 size_t nargs = jl_nparams(li->specTypes); // number of actual arguments being passed
-                emit_cfunc_invalidate(protodecl, proto_cc, li->specTypes, proto_rettype, nargs, world, globals);
+                emit_cfunc_invalidate(protodecl, proto_cc, li->specTypes, proto_rettype, nargs, params);
                 preal_decl = "";
             }
         }
@@ -5626,16 +5609,17 @@ void *jl_get_llvmf_defn(jl_method_instance_t *linfo, size_t world, char getwrapp
 
     // emit this function into a new module
     if (src && jl_is_code_info(src)) {
-        jl_codegen_call_targets_t workqueue;
-        std::map<void *, GlobalVariable*> globals;
-        Function *F = NULL;
+        jl_codegen_params_t output;
+        output.world = world;
+        output.params = &params;
         std::unique_ptr<Module> m;
         jl_llvm_functions_t decls;
         jl_value_t *rettype;
         uint8_t api;
         JL_LOCK(&codegen_lock);
-        std::tie(m, decls, rettype, api) = jl_compile_linfo1(linfo, src, world, workqueue, globals, false, &params);
+        std::tie(m, decls, rettype, api) = jl_compile_linfo1(linfo, src, output);
 
+        Function *F = NULL;
         if (m) {
             // if compilation succeeded, prepare to return the result
             const std::string *fname;

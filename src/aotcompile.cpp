@@ -227,42 +227,41 @@ extern "C"
 void *jl_create_native(jl_array_t *methods)
 {
     jl_native_code_desc_t *data = new jl_native_code_desc_t;
-    jl_codegen_call_targets_t workqueue;
+    jl_codegen_params_t params;
     std::map<jl_method_instance_t *, jl_compile_result_t> emitted;
-    std::map<void *, GlobalVariable*> globals;
     jl_method_instance_t *mi = NULL;
     jl_code_info_t *src = NULL;
     JL_GC_PUSH1(&src);
     JL_LOCK(&codegen_lock);
 
     for (int worlds = 2; worlds > 0; worlds--) {
-        size_t world = (worlds == 1 ? jl_world_counter : jl_typeinf_world);
-        if (!world)
+        params.world = (worlds == 1 ? jl_world_counter : jl_typeinf_world);
+        if (!params.world)
             continue;
         size_t i, l;
         for (i = 0, l = jl_array_len(methods); i < l; i++) {
             mi = (jl_method_instance_t*)jl_array_ptr_ref(methods, i);
-            if ((worlds == 1 || mi->max_world < jl_world_counter) && mi->min_world <= world && world <= mi->max_world) {
+            if ((worlds == 1 || mi->max_world < jl_world_counter) && mi->min_world <= params.world && params.world <= mi->max_world) {
                 src = (jl_code_info_t*)mi->inferred;
                 if (src && (jl_value_t*)src != jl_nothing)
                     src = jl_uncompress_ast(mi->def.method, (jl_array_t*)src);
                 if (!src || !jl_is_code_info(src)) {
-                    src = jl_type_infer(&mi, world, 0);
+                    src = jl_type_infer(&mi, params.world, 0);
                 }
                 if (!emitted.count(mi)) {
-                    jl_compile_result_t result = jl_compile_linfo1(mi, src, world, workqueue, globals, false, &jl_default_cgparams);
+                    jl_compile_result_t result = jl_compile_linfo1(mi, src, params);
                     if (std::get<0>(result))
                         emitted[mi] = std::move(result);
                 }
             }
         }
-        jl_compile_workqueue(world, false, emitted, workqueue, globals);
+        jl_compile_workqueue(emitted, params);
     }
     JL_GC_POP();
 
     // process the globals array, before jl_merge_module destroys them
     std::vector<std::string> gvars;
-    for (auto &global : globals) {
+    for (auto &global : params.globals) {
         gvars.push_back(global.second->getName());
         data->jl_value_to_llvm[global.first] = gvars.size();
     }
