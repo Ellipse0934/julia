@@ -1357,6 +1357,9 @@ end
 # PR #23332
 @deprecate ^(x, p::Integer) Base.power_by_squaring(x,p)
 
+# Issue 25786
+@deprecate_binding DevNull DEVNULL
+
 # END 0.7 deprecations
 
 # BEGIN 1.0 deprecations

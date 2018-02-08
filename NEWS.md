@@ -1030,6 +1030,8 @@ Deprecated or removed
   * The fallback method `^(x, p::Integer)` is deprecated. If your type relied on this definition,
     add a method such as `^(x::MyType, p::Integer) = Base.power_by_squaring(x, p)` ([#23332]).
 
+  * The constant `DevNull` has been deprecated in favor of `DEVNULL` ([#25786]).
+
 Command-line option changes
 ---------------------------
 
@@ -1288,3 +1290,4 @@ Command-line option changes
 [#25654]: https://github.com/JuliaLang/julia/issues/25654
 [#25655]: https://github.com/JuliaLang/julia/issues/25655
 [#25745]: https://github.com/JuliaLang/julia/issues/25745
+[#25786]: https://github.com/JuliaLang/julia/issues/25786
